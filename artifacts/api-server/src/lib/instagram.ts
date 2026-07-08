@@ -1,7 +1,12 @@
+import puppeteer from "puppeteer-core";
 import { detectGender, type Gender } from "./gender.js";
 
 const BASE_URL = "https://www.instagram.com";
 const API_URL = `${BASE_URL}/api/v1`;
+
+const CHROMIUM_PATH =
+  process.env.CHROMIUM_PATH ??
+  "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium";
 
 const BASE_HEADERS: Record<string, string> = {
   "User-Agent":
@@ -23,7 +28,7 @@ const BASE_HEADERS: Record<string, string> = {
 };
 
 // ---------------------------------------------------------------------------
-// Cookie helpers
+// Cookie helpers (for authenticated API calls after login)
 // ---------------------------------------------------------------------------
 
 function parseCookies(cookieHeaders: string[]): Record<string, string> {
@@ -42,97 +47,6 @@ function serializeCookies(cookies: Record<string, string>): string {
   return Object.entries(cookies)
     .map(([k, v]) => `${k}=${v}`)
     .join("; ");
-}
-
-function mergeCookies(
-  existing: Record<string, string>,
-  incoming: string[],
-): Record<string, string> {
-  return { ...existing, ...parseCookies(incoming) };
-}
-
-// ---------------------------------------------------------------------------
-// Session — mirrors Python requests.Session: accumulates cookies across every
-// redirect hop so that csrftoken set on a 302 is not lost.
-// ---------------------------------------------------------------------------
-
-class InstagramSession {
-  cookies: Record<string, string> = {};
-
-  private headers(extra: Record<string, string> = {}): Record<string, string> {
-    const cookieStr = serializeCookies(this.cookies);
-    return {
-      ...BASE_HEADERS,
-      ...(cookieStr ? { Cookie: cookieStr } : {}),
-      ...extra,
-    };
-  }
-
-  /** GET with manual redirect following so every hop's Set-Cookie is captured. */
-  async get(
-    url: string,
-    extra: Record<string, string> = {},
-  ): Promise<Response> {
-    let current = url;
-    let hops = 0;
-    let lastResp!: Response;
-
-    while (hops++ < 15) {
-      const resp = await fetch(current, {
-        headers: this.headers(extra),
-        redirect: "manual",
-      });
-
-      // Accumulate cookies from this hop
-      const setCookies = resp.headers.getSetCookie?.() ?? [];
-      this.cookies = mergeCookies(this.cookies, setCookies);
-
-      if (resp.status >= 300 && resp.status < 400) {
-        const location = resp.headers.get("location");
-        if (!location) break;
-        current = location.startsWith("http")
-          ? location
-          : new URL(location, current).href;
-        continue;
-      }
-
-      lastResp = resp;
-      break;
-    }
-
-    return lastResp;
-  }
-
-  /** POST — single shot, no redirects needed. */
-  async post(
-    url: string,
-    body: string,
-    extra: Record<string, string> = {},
-  ): Promise<Response> {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: this.headers(extra),
-      body,
-      redirect: "manual",
-    });
-
-    const setCookies = resp.headers.getSetCookie?.() ?? [];
-    this.cookies = mergeCookies(this.cookies, setCookies);
-
-    return resp;
-  }
-
-  get csrfToken(): string | undefined {
-    return this.cookies["csrftoken"];
-  }
-
-  get sessionId(): string | undefined {
-    return this.cookies["sessionid"];
-  }
-
-  get userId(): string {
-    return this.cookies["ds_user_id"] ?? "";
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +79,8 @@ export interface FollowerData {
 }
 
 // ---------------------------------------------------------------------------
-// Login
+// Login via headless Chromium (same approach as yenipuller.py / Selenium)
+// Instagram blocks plain HTTP from server IPs — real browser is required.
 // ---------------------------------------------------------------------------
 
 export async function instagramLogin(
@@ -173,126 +88,124 @@ export async function instagramLogin(
   password: string,
   twoFactorCode?: string,
 ): Promise<LoginResult> {
+  let browser;
   try {
-    const session = new InstagramSession();
-
-    // Step 1: GET login page — accumulates csrftoken across all redirect hops
-    await session.get(`${BASE_URL}/accounts/login/`);
-
-    const csrfToken = session.csrfToken;
-    if (!csrfToken) {
-      return {
-        success: false,
-        error: "Could not get CSRF token from Instagram",
-      };
-    }
-
-    // Step 2: POST login
-    const loginPayload = new URLSearchParams({
-      username,
-      enc_password: `#PWD_INSTAGRAM_BROWSER:0:${Math.floor(Date.now() / 1000)}:${encodeURIComponent(password)}`,
-      queryParams: "{}",
-      optIntoOneTap: "false",
-      trustedDeviceRecords: "{}",
+    browser = await puppeteer.launch({
+      executablePath: CHROMIUM_PATH,
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--window-size=1280,720",
+      ],
     });
 
-    const loginResp = await session.post(
-      `${BASE_URL}/api/v1/web/accounts/login/ajax/`,
-      loginPayload.toString(),
-      {
-        "X-CSRFToken": csrfToken,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-Instagram-AJAX": "1007616494",
-        Referer: `${BASE_URL}/accounts/login/`,
-      },
+    const page = await browser.newPage();
+
+    // Anti-bot: override user agent and hide automation signals
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     );
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    });
 
-    let loginData: Record<string, unknown>;
-    try {
-      loginData = (await loginResp.json()) as Record<string, unknown>;
-    } catch {
-      return { success: false, error: "Invalid response from Instagram" };
-    }
+    // Navigate to login page
+    await page.goto(`${BASE_URL}/accounts/login/`, {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
 
-    // Handle 2FA
-    if (loginData["two_factor_required"]) {
-      const twoFactorInfo = loginData["two_factor_info"] as
-        | Record<string, string>
-        | undefined;
+    // Fill credentials
+    await page.waitForSelector('input[name="username"]', { timeout: 10000 });
+    await page.type('input[name="username"]', username, { delay: 50 });
+    await page.type('input[name="password"]', password, { delay: 50 });
 
+    // Submit
+    await Promise.all([
+      page.click('button[type="submit"]'),
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {}),
+    ]);
+
+    // Give the page a moment to settle
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const currentUrl = page.url();
+
+    // Check for 2FA challenge
+    const needs2FA =
+      currentUrl.includes("two_factor") ||
+      currentUrl.includes("challenge") ||
+      (await page.$('input[name="verificationCode"]').catch(() => null)) !== null ||
+      (await page.$('input[aria-label*="ecurity"]').catch(() => null)) !== null;
+
+    if (needs2FA) {
       if (!twoFactorCode) {
+        await browser.close();
         return {
           success: false,
           requiresTwoFactor: true,
-          twoFactorIdentifier: twoFactorInfo?.["two_factor_identifier"],
           error: "Two-factor authentication required",
         };
       }
 
-      const tfaPayload = new URLSearchParams({
-        username,
-        verificationCode: twoFactorCode,
-        identifier: twoFactorInfo?.["two_factor_identifier"] ?? "",
-        queryParams: JSON.stringify({ next: "/" }),
-        trustThisDevice: "1",
-        twoFactorIdentifier: twoFactorInfo?.["two_factor_identifier"] ?? "",
-        verificationMethod: "3",
-      });
+      // Enter 2FA code
+      const codeInput = await page
+        .$('input[name="verificationCode"]')
+        .catch(() => null) ??
+        await page.$('input[aria-label*="ecurity"]').catch(() => null);
 
-      const updatedCsrf = session.csrfToken ?? csrfToken;
-      const tfaResp = await session.post(
-        `${BASE_URL}/api/v1/web/accounts/login/two_factor/`,
-        tfaPayload.toString(),
-        {
-          "X-CSRFToken": updatedCsrf,
-          "Content-Type": "application/x-www-form-urlencoded",
-          Referer: `${BASE_URL}/accounts/login/two_factor`,
-        },
-      );
-
-      let tfaData: Record<string, unknown>;
-      try {
-        tfaData = (await tfaResp.json()) as Record<string, unknown>;
-      } catch {
-        return { success: false, error: "Invalid 2FA response from Instagram" };
+      if (codeInput) {
+        await codeInput.type(twoFactorCode, { delay: 50 });
+        const submitBtn = await page.$('button[type="submit"]');
+        if (submitBtn) {
+          await Promise.all([
+            submitBtn.click(),
+            page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 }).catch(() => {}),
+          ]);
+          await new Promise((r) => setTimeout(r, 2000));
+        }
       }
-
-      if (!tfaData["authenticated"]) {
-        return {
-          success: false,
-          error: (tfaData["message"] as string) ?? "2FA verification failed",
-        };
-      }
-    } else if (!loginData["authenticated"]) {
-      const msg =
-        (loginData["message"] as string) ??
-        (loginData["error_type"] as string) ??
-        "Login failed";
-      return { success: false, error: msg };
     }
 
-    // Step 3: GET home page to finalize session cookies (sessionid, ds_user_id)
-    await session.get(`${BASE_URL}/`, {
-      Referer: `${BASE_URL}/accounts/login/`,
-    });
+    // Collect cookies from browser
+    const browserCookies = await page.cookies();
+    const cookieMap: Record<string, string> = {};
+    for (const c of browserCookies) {
+      cookieMap[c.name] = c.value;
+    }
 
-    const sessionId = session.sessionId;
+    const sessionId = cookieMap["sessionid"];
     if (!sessionId) {
+      // Check if still on login page — likely wrong credentials
+      const stillOnLogin =
+        page.url().includes("accounts/login") ||
+        page.url().includes("challenge");
+      await browser.close();
       return {
         success: false,
-        error: "Login appeared to succeed but no session cookie found",
+        error: stillOnLogin
+          ? "Login failed — check your username and password"
+          : "Login appeared to succeed but no session cookie was found",
       };
     }
+
+    await browser.close();
 
     return {
       success: true,
       session: {
-        cookies: session.cookies,
-        userId: session.userId,
+        cookies: cookieMap,
+        userId: cookieMap["ds_user_id"] ?? "",
         username,
       },
     };
   } catch (err: unknown) {
+    try { await browser?.close(); } catch { /* ignore */ }
     return {
       success: false,
       error: (err as Error).message ?? "Unknown error during login",
@@ -301,7 +214,7 @@ export async function instagramLogin(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers for authenticated requests
+// Helpers for authenticated API calls
 // ---------------------------------------------------------------------------
 
 function buildCookieHeader(sessionId: string, userId?: string): string {
@@ -329,9 +242,7 @@ export async function getInstagramUserId(
       },
     );
     if (!resp.ok) return null;
-    const data = (await resp.json()) as {
-      data?: { user?: { id?: string } };
-    };
+    const data = (await resp.json()) as { data?: { user?: { id?: string } } };
     return data?.data?.user?.id ?? null;
   } catch {
     return null;
@@ -367,21 +278,12 @@ export async function getFollowers(
 
     const resp = await fetch(
       `${API_URL}/friendships/${profileUserId}/followers/?count=100`,
-      {
-        headers: {
-          ...BASE_HEADERS,
-          Cookie: cookie,
-        },
-      },
+      { headers: { ...BASE_HEADERS, Cookie: cookie } },
     );
 
     if (resp.status === 401 || resp.status === 403) {
-      return {
-        success: false,
-        error: "Session expired or invalid. Please log in again.",
-      };
+      return { success: false, error: "Session expired or invalid. Please log in again." };
     }
-
     if (!resp.ok) {
       return { success: false, error: `Instagram API error: ${resp.status}` };
     }
@@ -397,8 +299,7 @@ export async function getFollowers(
         fullName: u.full_name,
         profilePicUrl: u.profile_pic_url,
         gender: detectGender(firstName),
-        followedByViewer:
-          u.friendship_status?.following ?? u.followed_by_viewer ?? false,
+        followedByViewer: u.friendship_status?.following ?? u.followed_by_viewer ?? false,
         isPrivate: u.is_private,
         isVerified: u.is_verified,
       };
@@ -410,31 +311,44 @@ export async function getFollowers(
   }
 }
 
+async function getCsrfFromBrowser(sessionId: string, userId?: string): Promise<string> {
+  const cookie = buildCookieHeader(sessionId, userId);
+  try {
+    const resp = await fetch(`${BASE_URL}/`, {
+      headers: { ...BASE_HEADERS, Cookie: cookie },
+      redirect: "manual",
+    });
+    const setCookies = resp.headers.getSetCookie?.() ?? [];
+    const parsed = parseCookies(setCookies);
+    return parsed["csrftoken"] ?? "";
+  } catch {
+    return "";
+  }
+}
+
 export async function followUser(
   targetUserId: string,
   sessionId: string,
   myUserId?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const session = new InstagramSession();
-    session.cookies = { sessionid: sessionId, ...(myUserId ? { ds_user_id: myUserId } : {}) };
+    const cookie = buildCookieHeader(sessionId, myUserId);
+    const csrfToken = await getCsrfFromBrowser(sessionId, myUserId);
 
-    await session.get(`${BASE_URL}/`);
-    const csrfToken = session.csrfToken ?? "";
-
-    const resp = await session.post(
-      `${API_URL}/friendships/create/${targetUserId}/`,
-      `user_id=${targetUserId}`,
-      {
+    const resp = await fetch(`${API_URL}/friendships/create/${targetUserId}/`, {
+      method: "POST",
+      headers: {
+        ...BASE_HEADERS,
+        Cookie: cookie,
         "X-CSRFToken": csrfToken,
         "Content-Type": "application/x-www-form-urlencoded",
       },
-    );
+      body: `user_id=${targetUserId}`,
+    });
 
     if (resp.status === 401 || resp.status === 403) {
       return { success: false, error: "Session expired or unauthorized" };
     }
-
     return { success: resp.ok };
   } catch (err: unknown) {
     return { success: false, error: (err as Error).message };
@@ -447,25 +361,23 @@ export async function unfollowUser(
   myUserId?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const session = new InstagramSession();
-    session.cookies = { sessionid: sessionId, ...(myUserId ? { ds_user_id: myUserId } : {}) };
+    const cookie = buildCookieHeader(sessionId, myUserId);
+    const csrfToken = await getCsrfFromBrowser(sessionId, myUserId);
 
-    await session.get(`${BASE_URL}/`);
-    const csrfToken = session.csrfToken ?? "";
-
-    const resp = await session.post(
-      `${API_URL}/friendships/destroy/${targetUserId}/`,
-      `user_id=${targetUserId}`,
-      {
+    const resp = await fetch(`${API_URL}/friendships/destroy/${targetUserId}/`, {
+      method: "POST",
+      headers: {
+        ...BASE_HEADERS,
+        Cookie: cookie,
         "X-CSRFToken": csrfToken,
         "Content-Type": "application/x-www-form-urlencoded",
       },
-    );
+      body: `user_id=${targetUserId}`,
+    });
 
     if (resp.status === 401 || resp.status === 403) {
       return { success: false, error: "Session expired or unauthorized" };
     }
-
     return { success: resp.ok };
   } catch (err: unknown) {
     return { success: false, error: (err as Error).message };
