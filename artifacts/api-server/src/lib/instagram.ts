@@ -3,50 +3,36 @@ import { detectGender, type Gender } from "./gender.js";
 const BASE_URL = "https://www.instagram.com";
 const API_URL = `${BASE_URL}/api/v1`;
 
-const DEFAULT_HEADERS = {
+const BASE_HEADERS: Record<string, string> = {
   "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Cache-Control": "no-cache",
-  Connection: "keep-alive",
-  "Upgrade-Insecure-Requests": "1",
-  "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-  "Sec-Ch-Ua-Mobile": "?0",
-  "Sec-Ch-Ua-Platform": '"Windows"',
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "none",
-  "Sec-Fetch-User": "?1",
-};
-
-const API_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   Accept: "*/*",
   "Accept-Language": "en-US,en;q=0.9",
   "Accept-Encoding": "gzip, deflate, br",
-  "X-IG-App-ID": "936619743392459",
-  "X-Requested-With": "XMLHttpRequest",
+  Connection: "keep-alive",
+  DNT: "1",
   Origin: BASE_URL,
   Referer: `${BASE_URL}/`,
-  "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-  "Sec-Ch-Ua-Mobile": "?0",
-  "Sec-Ch-Ua-Platform": '"Windows"',
   "Sec-Fetch-Dest": "empty",
   "Sec-Fetch-Mode": "cors",
   "Sec-Fetch-Site": "same-origin",
+  "X-Requested-With": "XMLHttpRequest",
+  "X-IG-App-ID": "936619743392459",
+  "X-IG-WWW-Claim": "0",
+  "X-ASBD-ID": "129477",
 };
+
+// ---------------------------------------------------------------------------
+// Cookie helpers
+// ---------------------------------------------------------------------------
 
 function parseCookies(cookieHeaders: string[]): Record<string, string> {
   const cookies: Record<string, string> = {};
   for (const header of cookieHeaders) {
-    const parts = header.split(";")[0].trim();
-    const idx = parts.indexOf("=");
+    const pair = header.split(";")[0].trim();
+    const idx = pair.indexOf("=");
     if (idx > 0) {
-      cookies[parts.slice(0, idx).trim()] = parts.slice(idx + 1).trim();
+      cookies[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
     }
   }
   return cookies;
@@ -65,7 +51,95 @@ function mergeCookies(
   return { ...existing, ...parseCookies(incoming) };
 }
 
-export interface InstagramSession {
+// ---------------------------------------------------------------------------
+// Session — mirrors Python requests.Session: accumulates cookies across every
+// redirect hop so that csrftoken set on a 302 is not lost.
+// ---------------------------------------------------------------------------
+
+class InstagramSession {
+  cookies: Record<string, string> = {};
+
+  private headers(extra: Record<string, string> = {}): Record<string, string> {
+    const cookieStr = serializeCookies(this.cookies);
+    return {
+      ...BASE_HEADERS,
+      ...(cookieStr ? { Cookie: cookieStr } : {}),
+      ...extra,
+    };
+  }
+
+  /** GET with manual redirect following so every hop's Set-Cookie is captured. */
+  async get(
+    url: string,
+    extra: Record<string, string> = {},
+  ): Promise<Response> {
+    let current = url;
+    let hops = 0;
+    let lastResp!: Response;
+
+    while (hops++ < 15) {
+      const resp = await fetch(current, {
+        headers: this.headers(extra),
+        redirect: "manual",
+      });
+
+      // Accumulate cookies from this hop
+      const setCookies = resp.headers.getSetCookie?.() ?? [];
+      this.cookies = mergeCookies(this.cookies, setCookies);
+
+      if (resp.status >= 300 && resp.status < 400) {
+        const location = resp.headers.get("location");
+        if (!location) break;
+        current = location.startsWith("http")
+          ? location
+          : new URL(location, current).href;
+        continue;
+      }
+
+      lastResp = resp;
+      break;
+    }
+
+    return lastResp;
+  }
+
+  /** POST — single shot, no redirects needed. */
+  async post(
+    url: string,
+    body: string,
+    extra: Record<string, string> = {},
+  ): Promise<Response> {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: this.headers(extra),
+      body,
+      redirect: "manual",
+    });
+
+    const setCookies = resp.headers.getSetCookie?.() ?? [];
+    this.cookies = mergeCookies(this.cookies, setCookies);
+
+    return resp;
+  }
+
+  get csrfToken(): string | undefined {
+    return this.cookies["csrftoken"];
+  }
+
+  get sessionId(): string | undefined {
+    return this.cookies["sessionid"];
+  }
+
+  get userId(): string {
+    return this.cookies["ds_user_id"] ?? "";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+export interface InstagramSession_ {
   cookies: Record<string, string>;
   userId: string;
   username: string;
@@ -73,7 +147,7 @@ export interface InstagramSession {
 
 export interface LoginResult {
   success: boolean;
-  session?: InstagramSession;
+  session?: InstagramSession_;
   requiresTwoFactor?: boolean;
   twoFactorIdentifier?: string;
   error?: string;
@@ -90,11 +164,9 @@ export interface FollowerData {
   isVerified?: boolean;
 }
 
-/** Extract csrftoken from HTML body (Instagram embeds it as "csrf_token":"...") */
-function extractCsrfFromHtml(html: string): string | undefined {
-  const match = html.match(/"csrf_token"\s*:\s*"([^"]+)"/);
-  return match?.[1];
-}
+// ---------------------------------------------------------------------------
+// Login
+// ---------------------------------------------------------------------------
 
 export async function instagramLogin(
   username: string,
@@ -102,53 +174,20 @@ export async function instagramLogin(
   twoFactorCode?: string,
 ): Promise<LoginResult> {
   try {
-    let cookies: Record<string, string> = {};
+    const session = new InstagramSession();
 
-    // Step 1: GET main page first (more reliable for cookies than login page)
-    const mainResp = await fetch(`${BASE_URL}/`, {
-      headers: DEFAULT_HEADERS,
-      redirect: "follow",
-    });
-    const mainCookieHeaders = mainResp.headers.getSetCookie?.() ?? [];
-    cookies = mergeCookies(cookies, mainCookieHeaders);
+    // Step 1: GET login page — accumulates csrftoken across all redirect hops
+    await session.get(`${BASE_URL}/accounts/login/`);
 
-    // Step 2: GET login page — may set additional cookies
-    const initResp = await fetch(`${BASE_URL}/accounts/login/`, {
-      headers: {
-        ...DEFAULT_HEADERS,
-        Referer: `${BASE_URL}/`,
-        Cookie: serializeCookies(cookies),
-      },
-      redirect: "follow",
-    });
-    const initCookieHeaders = initResp.headers.getSetCookie?.() ?? [];
-    cookies = mergeCookies(cookies, initCookieHeaders);
-
-    // Prefer cookie value; fall back to extracting from HTML
-    let csrfToken = cookies["csrftoken"];
+    const csrfToken = session.csrfToken;
     if (!csrfToken) {
-      try {
-        const html = await initResp.text();
-        csrfToken = extractCsrfFromHtml(html);
-      } catch {
-        // ignore parse errors
-      }
-    }
-    // Last resort: try main page HTML
-    if (!csrfToken) {
-      try {
-        const html = await mainResp.clone().text();
-        csrfToken = extractCsrfFromHtml(html);
-      } catch {
-        // ignore
-      }
+      return {
+        success: false,
+        error: "Could not get CSRF token from Instagram",
+      };
     }
 
-    if (!csrfToken) {
-      return { success: false, error: "Could not get CSRF token from Instagram" };
-    }
-
-    // Step 3: POST login
+    // Step 2: POST login
     const loginPayload = new URLSearchParams({
       username,
       enc_password: `#PWD_INSTAGRAM_BROWSER:0:${Math.floor(Date.now() / 1000)}:${encodeURIComponent(password)}`,
@@ -157,21 +196,16 @@ export async function instagramLogin(
       trustedDeviceRecords: "{}",
     });
 
-    const loginResp = await fetch(`${BASE_URL}/api/v1/web/accounts/login/ajax/`, {
-      method: "POST",
-      headers: {
-        ...API_HEADERS,
+    const loginResp = await session.post(
+      `${BASE_URL}/api/v1/web/accounts/login/ajax/`,
+      loginPayload.toString(),
+      {
         "X-CSRFToken": csrfToken,
         "Content-Type": "application/x-www-form-urlencoded",
-        Cookie: serializeCookies(cookies),
+        "X-Instagram-AJAX": "1007616494",
         Referer: `${BASE_URL}/accounts/login/`,
       },
-      body: loginPayload.toString(),
-      redirect: "manual",
-    });
-
-    const loginCookies = loginResp.headers.getSetCookie?.() ?? [];
-    cookies = mergeCookies(cookies, loginCookies);
+    );
 
     let loginData: Record<string, unknown>;
     try {
@@ -182,7 +216,10 @@ export async function instagramLogin(
 
     // Handle 2FA
     if (loginData["two_factor_required"]) {
-      const twoFactorInfo = loginData["two_factor_info"] as Record<string, string> | undefined;
+      const twoFactorInfo = loginData["two_factor_info"] as
+        | Record<string, string>
+        | undefined;
+
       if (!twoFactorCode) {
         return {
           success: false,
@@ -192,7 +229,6 @@ export async function instagramLogin(
         };
       }
 
-      // Submit 2FA code
       const tfaPayload = new URLSearchParams({
         username,
         verificationCode: twoFactorCode,
@@ -203,22 +239,16 @@ export async function instagramLogin(
         verificationMethod: "3",
       });
 
-      const updatedCsrf = cookies["csrftoken"] ?? csrfToken;
-      const tfaResp = await fetch(`${BASE_URL}/api/v1/web/accounts/login/two_factor/`, {
-        method: "POST",
-        headers: {
-          ...API_HEADERS,
+      const updatedCsrf = session.csrfToken ?? csrfToken;
+      const tfaResp = await session.post(
+        `${BASE_URL}/api/v1/web/accounts/login/two_factor/`,
+        tfaPayload.toString(),
+        {
           "X-CSRFToken": updatedCsrf,
           "Content-Type": "application/x-www-form-urlencoded",
-          Cookie: serializeCookies(cookies),
           Referer: `${BASE_URL}/accounts/login/two_factor`,
         },
-        body: tfaPayload.toString(),
-        redirect: "manual",
-      });
-
-      const tfaCookies = tfaResp.headers.getSetCookie?.() ?? [];
-      cookies = mergeCookies(cookies, tfaCookies);
+      );
 
       let tfaData: Record<string, unknown>;
       try {
@@ -228,50 +258,54 @@ export async function instagramLogin(
       }
 
       if (!tfaData["authenticated"]) {
-        return { success: false, error: (tfaData["message"] as string) ?? "2FA verification failed" };
+        return {
+          success: false,
+          error: (tfaData["message"] as string) ?? "2FA verification failed",
+        };
       }
     } else if (!loginData["authenticated"]) {
-      const msg = (loginData["message"] as string) ?? (loginData["error_type"] as string) ?? "Login failed";
+      const msg =
+        (loginData["message"] as string) ??
+        (loginData["error_type"] as string) ??
+        "Login failed";
       return { success: false, error: msg };
     }
 
-    // Get home page to pick up sessionid cookie
-    const homeResp = await fetch(`${BASE_URL}/`, {
-      headers: {
-        ...API_HEADERS,
-        Cookie: serializeCookies(cookies),
-        Referer: `${BASE_URL}/accounts/login/`,
-      },
-      redirect: "follow",
+    // Step 3: GET home page to finalize session cookies (sessionid, ds_user_id)
+    await session.get(`${BASE_URL}/`, {
+      Referer: `${BASE_URL}/accounts/login/`,
     });
-    const homeCookies = homeResp.headers.getSetCookie?.() ?? [];
-    cookies = mergeCookies(cookies, homeCookies);
 
-    const sessionId = cookies["sessionid"];
-    const userId = cookies["ds_user_id"] ?? "";
-    const igUsername = cookies["ig_did"] ?? username; // use login username as fallback
-
+    const sessionId = session.sessionId;
     if (!sessionId) {
-      return { success: false, error: "Login appeared to succeed but no session cookie found" };
+      return {
+        success: false,
+        error: "Login appeared to succeed but no session cookie found",
+      };
     }
 
     return {
       success: true,
       session: {
-        cookies,
-        userId,
+        cookies: session.cookies,
+        userId: session.userId,
         username,
       },
     };
   } catch (err: unknown) {
-    return { success: false, error: (err as Error).message ?? "Unknown error during login" };
+    return {
+      success: false,
+      error: (err as Error).message ?? "Unknown error during login",
+    };
   }
 }
 
-export function buildCookieHeader(sessionId: string, userId?: string): string {
-  const base: Record<string, string> = {
-    sessionid: sessionId,
-  };
+// ---------------------------------------------------------------------------
+// Helpers for authenticated requests
+// ---------------------------------------------------------------------------
+
+function buildCookieHeader(sessionId: string, userId?: string): string {
+  const base: Record<string, string> = { sessionid: sessionId };
   if (userId) base["ds_user_id"] = userId;
   return serializeCookies(base);
 }
@@ -288,14 +322,16 @@ export async function getInstagramUserId(
       `${BASE_URL}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`,
       {
         headers: {
-          ...DEFAULT_HEADERS,
+          ...BASE_HEADERS,
           Cookie: cookie,
           ...(csrfToken ? { "X-CSRFToken": csrfToken } : {}),
         },
       },
     );
     if (!resp.ok) return null;
-    const data = (await resp.json()) as { data?: { user?: { id?: string } } };
+    const data = (await resp.json()) as {
+      data?: { user?: { id?: string } };
+    };
     return data?.data?.user?.id ?? null;
   } catch {
     return null;
@@ -321,24 +357,29 @@ export async function getFollowers(
   try {
     const cookie = buildCookieHeader(sessionId, userId);
 
-    // First get the profile's userId
     const profileUserId = await getInstagramUserId(username, sessionId, userId);
     if (!profileUserId) {
-      return { success: false, error: "Could not find user — account may be private or not exist" };
+      return {
+        success: false,
+        error: "Could not find user — account may be private or not exist",
+      };
     }
 
     const resp = await fetch(
       `${API_URL}/friendships/${profileUserId}/followers/?count=100`,
       {
         headers: {
-          ...DEFAULT_HEADERS,
+          ...BASE_HEADERS,
           Cookie: cookie,
         },
       },
     );
 
     if (resp.status === 401 || resp.status === 403) {
-      return { success: false, error: "Session expired or invalid. Please log in again." };
+      return {
+        success: false,
+        error: "Session expired or invalid. Please log in again.",
+      };
     }
 
     if (!resp.ok) {
@@ -356,7 +397,8 @@ export async function getFollowers(
         fullName: u.full_name,
         profilePicUrl: u.profile_pic_url,
         gender: detectGender(firstName),
-        followedByViewer: u.friendship_status?.following ?? u.followed_by_viewer ?? false,
+        followedByViewer:
+          u.friendship_status?.following ?? u.followed_by_viewer ?? false,
         isPrivate: u.is_private,
         isVerified: u.is_verified,
       };
@@ -374,25 +416,20 @@ export async function followUser(
   myUserId?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const cookie = buildCookieHeader(sessionId, myUserId);
+    const session = new InstagramSession();
+    session.cookies = { sessionid: sessionId, ...(myUserId ? { ds_user_id: myUserId } : {}) };
 
-    // Get CSRF token
-    const csrfResp = await fetch(`${BASE_URL}/`, {
-      headers: { ...DEFAULT_HEADERS, Cookie: cookie },
-    });
-    const csrfCookies = parseCookies(csrfResp.headers.getSetCookie?.() ?? []);
-    const csrfToken = csrfCookies["csrftoken"] ?? "";
+    await session.get(`${BASE_URL}/`);
+    const csrfToken = session.csrfToken ?? "";
 
-    const resp = await fetch(`${API_URL}/friendships/create/${targetUserId}/`, {
-      method: "POST",
-      headers: {
-        ...DEFAULT_HEADERS,
-        Cookie: cookie,
+    const resp = await session.post(
+      `${API_URL}/friendships/create/${targetUserId}/`,
+      `user_id=${targetUserId}`,
+      {
         "X-CSRFToken": csrfToken,
         "Content-Type": "application/x-www-form-urlencoded",
       },
-      body: `user_id=${targetUserId}`,
-    });
+    );
 
     if (resp.status === 401 || resp.status === 403) {
       return { success: false, error: "Session expired or unauthorized" };
@@ -410,24 +447,20 @@ export async function unfollowUser(
   myUserId?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const cookie = buildCookieHeader(sessionId, myUserId);
+    const session = new InstagramSession();
+    session.cookies = { sessionid: sessionId, ...(myUserId ? { ds_user_id: myUserId } : {}) };
 
-    const csrfResp = await fetch(`${BASE_URL}/`, {
-      headers: { ...DEFAULT_HEADERS, Cookie: cookie },
-    });
-    const csrfCookies = parseCookies(csrfResp.headers.getSetCookie?.() ?? []);
-    const csrfToken = csrfCookies["csrftoken"] ?? "";
+    await session.get(`${BASE_URL}/`);
+    const csrfToken = session.csrfToken ?? "";
 
-    const resp = await fetch(`${API_URL}/friendships/destroy/${targetUserId}/`, {
-      method: "POST",
-      headers: {
-        ...DEFAULT_HEADERS,
-        Cookie: cookie,
+    const resp = await session.post(
+      `${API_URL}/friendships/destroy/${targetUserId}/`,
+      `user_id=${targetUserId}`,
+      {
         "X-CSRFToken": csrfToken,
         "Content-Type": "application/x-www-form-urlencoded",
       },
-      body: `user_id=${targetUserId}`,
-    });
+    );
 
     if (resp.status === 401 || resp.status === 403) {
       return { success: false, error: "Session expired or unauthorized" };
