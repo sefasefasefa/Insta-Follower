@@ -120,14 +120,22 @@ export async function instagramLogin(
       timeout: 30000,
     });
 
-    // Fill credentials
-    await page.waitForSelector('input[name="username"]', { timeout: 10000 });
-    await page.type('input[name="username"]', username, { delay: 50 });
-    await page.type('input[name="password"]', password, { delay: 50 });
+    // Fill credentials — Instagram uses name="email" and name="pass" in newer UI
+    await page.waitForSelector('input[name="email"], input[name="username"]', { timeout: 15000 });
+    const usernameInput = await page.$('input[name="email"]') ?? await page.$('input[name="username"]');
+    if (!usernameInput) throw new Error("Could not find username/email input");
+    await usernameInput.type(username, { delay: 60 });
 
-    // Submit
+    const passwordInput = await page.$('input[name="pass"]') ?? await page.$('input[name="password"]');
+    if (!passwordInput) throw new Error("Could not find password input");
+    await passwordInput.type(password, { delay: 60 });
+
+    // Small pause to let Instagram validate the form (enables the submit button)
+    await new Promise((r) => setTimeout(r, 800));
+
+    // Submit — press Enter (most reliable across UI versions)
     await Promise.all([
-      page.click('button[type="submit"]'),
+      passwordInput.press("Enter"),
       page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {}),
     ]);
 
