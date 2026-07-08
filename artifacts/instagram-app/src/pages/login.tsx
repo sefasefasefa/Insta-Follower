@@ -126,7 +126,7 @@ export default function Login() {
             </motion.div>
             <div className="space-y-1">
               <CardTitle className="text-3xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-white/70">
-                Follower Analyzer
+                Story Liker
               </CardTitle>
               <CardDescription className="text-base text-white/50">
                 Sign in with your Instagram account to view advanced analytics
