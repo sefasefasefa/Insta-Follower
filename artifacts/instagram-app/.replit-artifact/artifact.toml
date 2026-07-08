@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "Instagram Follower Analyzer"
+version = "1.0.0"
+id = "artifacts/instagram-app"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23535
+
+[services.development]
+run = "pnpm --filter @workspace/instagram-app run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/instagram-app", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/instagram-app/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23535"
+BASE_PATH = "/"

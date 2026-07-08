@@ -3,13 +3,17 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Instagram Follower Analyzer API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: auth
+    description: Instagram authentication
+  - name: followers
+    description: Follower management
 paths:
   /healthz:
     get:
@@ -24,6 +28,156 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /auth/login:
+    post:
+      operationId: login
+      tags: [auth]
+      summary: Login to Instagram
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [auth]
+      summary: Logout from Instagram
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /auth/session:
+    get:
+      operationId: getSession
+      tags: [auth]
+      summary: Check current session status
+      responses:
+        "200":
+          description: Session info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+
+  /followers/{username}:
+    get:
+      operationId: getFollowers
+      tags: [followers]
+      summary: Get followers of an Instagram user
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: sessionId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Follower list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FollowersResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /followers/follow/{userId}:
+    post:
+      operationId: followUser
+      tags: [followers]
+      summary: Follow a user
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionRequest"
+      responses:
+        "200":
+          description: Follow result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /followers/unfollow/{userId}:
+    post:
+      operationId: unfollowUser
+      tags: [followers]
+      summary: Unfollow a user
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionRequest"
+      responses:
+        "200":
+          description: Unfollow result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +188,138 @@ components:
       required:
         - status
 
+    LoginRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+        twoFactorCode:
+          type: string
+      required:
+        - username
+        - password
+
+    LoginResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        sessionId:
+          type: string
+        userId:
+          type: string
+        username:
+          type: string
+        requiresTwoFactor:
+          type: boolean
+        twoFactorIdentifier:
+          type: string
+        error:
+          type: string
+      required:
+        - success
+
+    SessionRequest:
+      type: object
+      properties:
+        sessionId:
+          type: string
+      required:
+        - sessionId
+
+    SessionResponse:
+      type: object
+      properties:
+        loggedIn:
+          type: boolean
+        sessionId:
+          type: string
+        username:
+          type: string
+      required:
+        - loggedIn
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+      required:
+        - success
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+      required:
+        - error
+
+    Follower:
+      type: object
+      properties:
+        userId:
+          type: string
+        username:
+          type: string
+        fullName:
+          type: string
+        profilePicUrl:
+          type: string
+        gender:
+          type: string
+          enum: [male, female, mostly_male, mostly_female, andy, unknown]
+        followedByViewer:
+          type: boolean
+        isPrivate:
+          type: boolean
+        isVerified:
+          type: boolean
+      required:
+        - userId
+        - username
+        - followedByViewer
+
+    FollowersResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        followers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Follower"
+        total:
+          type: integer
+        stats:
+          $ref: "#/components/schemas/FollowerStats"
+      required:
+        - success
+        - followers
+        - total
+
+    FollowerStats:
+      type: object
+      properties:
+        total:
+          type: integer
+        male:
+          type: integer
+        female:
+          type: integer
+        unknown:
+          type: integer
+        following:
+          type: integer
+      required:
+        - total
+        - male
+        - female
+        - unknown
+        - following
