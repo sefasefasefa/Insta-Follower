@@ -93,7 +93,7 @@ export default function Login() {
           toast({
             variant: "destructive",
             title: "Error",
-            description: error.error || "Failed to login.",
+            description: error.data?.error || "Failed to login.",
           });
         },
       }
