@@ -5,13 +5,36 @@ const API_URL = `${BASE_URL}/api/v1`;
 
 const DEFAULT_HEADERS = {
   "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Cache-Control": "no-cache",
+  Connection: "keep-alive",
+  "Upgrade-Insecure-Requests": "1",
+  "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "Sec-Ch-Ua-Mobile": "?0",
+  "Sec-Ch-Ua-Platform": '"Windows"',
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-User": "?1",
+};
+
+const API_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   Accept: "*/*",
   "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
   "X-IG-App-ID": "936619743392459",
   "X-Requested-With": "XMLHttpRequest",
   Origin: BASE_URL,
   Referer: `${BASE_URL}/`,
+  "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "Sec-Ch-Ua-Mobile": "?0",
+  "Sec-Ch-Ua-Platform": '"Windows"',
   "Sec-Fetch-Dest": "empty",
   "Sec-Fetch-Mode": "cors",
   "Sec-Fetch-Site": "same-origin",
@@ -67,6 +90,12 @@ export interface FollowerData {
   isVerified?: boolean;
 }
 
+/** Extract csrftoken from HTML body (Instagram embeds it as "csrf_token":"...") */
+function extractCsrfFromHtml(html: string): string | undefined {
+  const match = html.match(/"csrf_token"\s*:\s*"([^"]+)"/);
+  return match?.[1];
+}
+
 export async function instagramLogin(
   username: string,
   password: string,
@@ -75,20 +104,51 @@ export async function instagramLogin(
   try {
     let cookies: Record<string, string> = {};
 
-    // Step 1: GET login page to pick up initial cookies (csrftoken)
-    const initResp = await fetch(`${BASE_URL}/accounts/login/`, {
+    // Step 1: GET main page first (more reliable for cookies than login page)
+    const mainResp = await fetch(`${BASE_URL}/`, {
       headers: DEFAULT_HEADERS,
       redirect: "follow",
     });
-    const initCookies = initResp.headers.getSetCookie?.() ?? [];
-    cookies = mergeCookies(cookies, initCookies);
+    const mainCookieHeaders = mainResp.headers.getSetCookie?.() ?? [];
+    cookies = mergeCookies(cookies, mainCookieHeaders);
 
-    const csrfToken = cookies["csrftoken"];
+    // Step 2: GET login page — may set additional cookies
+    const initResp = await fetch(`${BASE_URL}/accounts/login/`, {
+      headers: {
+        ...DEFAULT_HEADERS,
+        Referer: `${BASE_URL}/`,
+        Cookie: serializeCookies(cookies),
+      },
+      redirect: "follow",
+    });
+    const initCookieHeaders = initResp.headers.getSetCookie?.() ?? [];
+    cookies = mergeCookies(cookies, initCookieHeaders);
+
+    // Prefer cookie value; fall back to extracting from HTML
+    let csrfToken = cookies["csrftoken"];
+    if (!csrfToken) {
+      try {
+        const html = await initResp.text();
+        csrfToken = extractCsrfFromHtml(html);
+      } catch {
+        // ignore parse errors
+      }
+    }
+    // Last resort: try main page HTML
+    if (!csrfToken) {
+      try {
+        const html = await mainResp.clone().text();
+        csrfToken = extractCsrfFromHtml(html);
+      } catch {
+        // ignore
+      }
+    }
+
     if (!csrfToken) {
       return { success: false, error: "Could not get CSRF token from Instagram" };
     }
 
-    // Step 2: POST login
+    // Step 3: POST login
     const loginPayload = new URLSearchParams({
       username,
       enc_password: `#PWD_INSTAGRAM_BROWSER:0:${Math.floor(Date.now() / 1000)}:${encodeURIComponent(password)}`,
@@ -100,10 +160,11 @@ export async function instagramLogin(
     const loginResp = await fetch(`${BASE_URL}/api/v1/web/accounts/login/ajax/`, {
       method: "POST",
       headers: {
-        ...DEFAULT_HEADERS,
+        ...API_HEADERS,
         "X-CSRFToken": csrfToken,
         "Content-Type": "application/x-www-form-urlencoded",
         Cookie: serializeCookies(cookies),
+        Referer: `${BASE_URL}/accounts/login/`,
       },
       body: loginPayload.toString(),
       redirect: "manual",
@@ -146,7 +207,7 @@ export async function instagramLogin(
       const tfaResp = await fetch(`${BASE_URL}/api/v1/web/accounts/login/two_factor/`, {
         method: "POST",
         headers: {
-          ...DEFAULT_HEADERS,
+          ...API_HEADERS,
           "X-CSRFToken": updatedCsrf,
           "Content-Type": "application/x-www-form-urlencoded",
           Cookie: serializeCookies(cookies),
@@ -177,8 +238,9 @@ export async function instagramLogin(
     // Get home page to pick up sessionid cookie
     const homeResp = await fetch(`${BASE_URL}/`, {
       headers: {
-        ...DEFAULT_HEADERS,
+        ...API_HEADERS,
         Cookie: serializeCookies(cookies),
+        Referer: `${BASE_URL}/accounts/login/`,
       },
       redirect: "follow",
     });
